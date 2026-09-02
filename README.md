@@ -85,14 +85,16 @@ level.
 | `POST /command` | bearer | `{"command": "..."}` → allowlist check → console → `{"rule": "...", "output": "..."}` |
 | `GET /permissions` | bearer | Parsed `permissions.json` |
 | `GET /allowlist` | bearer | Parsed `allowlist.json` |
-| `GET /events` | bearer | Typed server log events (stdout source wiring is Stage 2 scope; returns `[]` for now) |
+| `GET /events?since=<id>` | bearer | Typed events (connect/disconnect/crash/content-error), fed from the same console websocket's stdout/stderr/logHistory broadcasts - no separate log-tailing |
 | `GET /healthz` | none | Liveness |
 | `GET /metrics` | none | Prometheus |
 
 ## Status
 
 Stage 0/1 scaffold: allowlist, permissions/allowlist parsing, console
-websocket client, and HTTP surface are implemented and tested. `/events`'
-real stdout source, and the event-pattern regexes for crash/content-log
-detection, need validation against real server logs before they're trusted
-in production — see comments in `events.go`.
+websocket client, and HTTP surface are implemented and tested. `/events` is
+wired end-to-end off the console websocket's own broadcasts (no separate
+log source), with a bounded in-memory buffer and ID-based paging. The
+crash/content-log detection regexes in `events.go` are still best-effort -
+they haven't been validated against a real crash or content-log error, only
+against the documented connect/disconnect line shapes.
