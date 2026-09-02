@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -136,10 +137,16 @@ func (s *server) handleAllowlist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	// The real stdout source is wired in Stage 2 (the log path depends on
-	// final sidecar volume/log wiring); for now this returns an empty set
-	// rather than guessing a source, so callers see a defined contract.
-	writeJSONResponse(w, []Event{})
+	var since int64
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			http.Error(w, "since must be an integer event ID", http.StatusBadRequest)
+			return
+		}
+		since = parsed
+	}
+	writeJSONResponse(w, s.console.Events.Since(since))
 }
 
 func writeJSONResponse(w http.ResponseWriter, v any) {
