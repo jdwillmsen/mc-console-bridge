@@ -23,7 +23,7 @@ bridge speaks the console's real transport (`mc-server-runner`'s
   `Authorization`.
 - Messages are JSON: send `{"type":"stdin","data":"<command>\n"}`; the server
   broadcasts `{"type":"stdout"|"stderr","data":"..."}` for console output and
-  `{"type":"logHistory","lines":[...]}"` once on connect.
+  `{"type":"logHistory","lines":[...]}` once on connect.
 - **Origin checking is on by default and rejects everything** unless the
   server sets `WEBSOCKET_DISABLE_ORIGIN_CHECK=true` (or configures
   `WEBSOCKET_ALLOWED_ORIGINS` to include whatever Origin this bridge sends,
@@ -89,6 +89,18 @@ level.
 | `GET /healthz` | none | Liveness - process is up. Stays green while the console is down, since a restart cannot fix a server that has not opened its console yet |
 | `GET /readyz` | none | Readiness - 200 only while the console websocket is established, so a bridge whose console auth is rejected stops receiving traffic |
 | `GET /metrics` | none | Prometheus |
+
+## Build and test
+
+```sh
+go test ./... -race      # unit tests
+gofmt -l . && go vet ./...
+docker build -t mc-console-bridge .
+```
+
+The binary is static (`CGO_ENABLED=0`) and ships on a distroless nonroot
+base, so the sidecar image carries no shell. CI runs these same checks
+(`.github/workflows/ci.yml`).
 
 ## Status
 

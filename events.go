@@ -31,9 +31,9 @@ type Event struct {
 	Raw    string    `json:"raw"`
 }
 
-// The connect/disconnect patterns match the ones already relied on by the
-// platform's Grafana dashboard (tenant-overview.json), which are the only
-// confirmed-stable signatures for these events in Bedrock's console output.
+// The connect/disconnect patterns match the ones the platform's Grafana
+// dashboards already rely on, which are the only confirmed-stable signatures
+// for these events in Bedrock's console output.
 var (
 	connectRe    = regexp.MustCompile(`Player connected: (?P<player>[^,]+),`)
 	disconnectRe = regexp.MustCompile(`Player disconnected: (?P<player>[^,]+),`)
@@ -46,10 +46,9 @@ var (
 	contentErrorRe = regexp.MustCompile(`^\[.*\]\s*\[ERROR\]`)
 
 	// crashRe is deliberately narrow: it has not been validated against the
-	// open upstream join crash (std::length_error abort, see
-	// jdw-deployments/docs/incidents/2026-08-31-bedrock-crash-on-player-join.md)
-	// because that crash was not reproduced during this scaffold. Treat crash
-	// detection as a placeholder to be tightened against a real crash log.
+	// open upstream join crash (a std::length_error abort) because that crash
+	// was not reproduced during this scaffold. Treat crash detection as a
+	// placeholder to be tightened against a real crash log.
 	crashRe = regexp.MustCompile(`(?i)(unhandled exception|fatal error|terminate called)`)
 )
 
