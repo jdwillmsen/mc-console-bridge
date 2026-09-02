@@ -17,8 +17,9 @@ type Config struct {
 	ConsoleAddr string
 	// ConsolePassword is the WEBSOCKET_PASSWORD configured on the server container.
 	ConsolePassword string
-	// CommandTimeout bounds how long SendCommand waits for a reply and for a
-	// reconnect attempt.
+	// CommandTimeout bounds how long SendCommand waits for the console write
+	// to complete, and caps the window it then spends collecting the
+	// command's output.
 	CommandTimeout time.Duration
 
 	// DataDir is where the server's permissions.json and allowlist.json live

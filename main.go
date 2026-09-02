@@ -22,7 +22,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	console := NewConsole(cfg.ConsoleAddr, cfg.ConsolePassword, logger)
+	console := NewConsole(cfg.ConsoleAddr, cfg.ConsolePassword, cfg.CommandTimeout, logger)
 	go console.Run(ctx)
 
 	srv := &server{cfg: cfg, console: console, logger: logger}

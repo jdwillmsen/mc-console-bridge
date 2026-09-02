@@ -23,10 +23,14 @@ var (
 		Name: "mc_console_bridge_commands_refused_total",
 		Help: "Console commands refused by the allowlist.",
 	})
+	metricCommandsFailed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "mc_console_bridge_commands_failed_total",
+		Help: "Allowlisted console commands that could not be delivered to the server.",
+	})
 )
 
 func init() {
-	prometheus.MustRegister(metricCommandsRun, metricCommandsRefused)
+	prometheus.MustRegister(metricCommandsRun, metricCommandsRefused, metricCommandsFailed)
 }
 
 type server struct {
@@ -38,6 +42,7 @@ type server struct {
 func newMux(s *server) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
 	mux.Handle("POST /command", s.authed(s.handleCommand))
@@ -65,9 +70,27 @@ func (s *server) authed(h http.HandlerFunc) http.Handler {
 	})
 }
 
+// handleHealthz is pure liveness: the process is up and serving. It stays
+// green while the console is down, because restarting the bridge cannot fix a
+// server that has not opened its console yet.
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
+
+// handleReadyz reports whether the bridge can actually do its job. Without a
+// console connection every POST /command fails, so readiness must follow the
+// websocket rather than the process.
+func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if !s.console.Connected() {
+		http.Error(w, "console not connected", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// maxCommandBodyBytes caps POST /command request bodies. The longest
+// allowlisted command is a tellraw payload, orders of magnitude under this.
+const maxCommandBodyBytes = 16 << 10
 
 type commandRequest struct {
 	Command string `json:"command"`
@@ -79,6 +102,8 @@ type commandResponse struct {
 }
 
 func (s *server) handleCommand(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCommandBodyBytes)
+
 	var req commandRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -95,6 +120,7 @@ func (s *server) handleCommand(w http.ResponseWriter, r *http.Request) {
 
 	out, err := s.console.SendCommand(r.Context(), req.Command)
 	if err != nil {
+		metricCommandsFailed.Inc()
 		s.logger.Warn("command send failed", "command", req.Command, "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

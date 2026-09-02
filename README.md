@@ -86,7 +86,8 @@ level.
 | `GET /permissions` | bearer | Parsed `permissions.json` |
 | `GET /allowlist` | bearer | Parsed `allowlist.json` |
 | `GET /events?since=<id>` | bearer | Typed events (connect/disconnect/crash/content-error), fed from the same console websocket's stdout/stderr/logHistory broadcasts - no separate log-tailing |
-| `GET /healthz` | none | Liveness |
+| `GET /healthz` | none | Liveness - process is up. Stays green while the console is down, since a restart cannot fix a server that has not opened its console yet |
+| `GET /readyz` | none | Readiness - 200 only while the console websocket is established, so a bridge whose console auth is rejected stops receiving traffic |
 | `GET /metrics` | none | Prometheus |
 
 ## Status

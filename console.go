@@ -23,6 +23,7 @@ const (
 
 	// commandCollectWindow is how long SendCommand waits for stdout/stderr
 	// broadcasts after writing a command, before returning whatever arrived.
+	// Config.CommandTimeout caps it if it is set lower.
 	// The protocol carries no request/response correlation id, so output
 	// collected in this window may include unrelated concurrent console
 	// activity. That is an inherent limit of the console protocol, not a
@@ -31,6 +32,11 @@ const (
 
 	minReconnectDelay = 1 * time.Second
 	maxReconnectDelay = 30 * time.Second
+
+	// maxResidualLine bounds the partial-line buffer held between websocket
+	// frames. A console line longer than this is discarded rather than grown
+	// without limit, mirroring ParseEvents' scanner cap.
+	maxResidualLine = 1 << 20
 )
 
 // wsMessage mirrors the JSON envelope mc-server-runner uses on the wire.
@@ -47,9 +53,10 @@ type wsMessage struct {
 // logHistory backfill over this same connection, so no separate log-tailing
 // mechanism is needed for GET /events.
 type Console struct {
-	addr     string
-	password string
-	logger   *slog.Logger
+	addr           string
+	password       string
+	commandTimeout time.Duration
+	logger         *slog.Logger
 
 	mu        sync.Mutex
 	conn      *websocket.Conn
@@ -58,16 +65,24 @@ type Console struct {
 	subMu       sync.Mutex
 	subscribers map[chan wsMessage]struct{}
 
+	// residual holds the trailing bytes of a stdout/stderr frame that did
+	// not end on a line boundary. mc-server-runner broadcasts pipe-read
+	// chunks, not lines, so a log line can straddle two frames. Only the
+	// connectAndRead read loop touches these, so they need no lock.
+	residual map[string]string
+
 	Events *EventLog
 }
 
-func NewConsole(addr, password string, logger *slog.Logger) *Console {
+func NewConsole(addr, password string, commandTimeout time.Duration, logger *slog.Logger) *Console {
 	return &Console{
-		addr:        addr,
-		password:    password,
-		logger:      logger,
-		subscribers: make(map[chan wsMessage]struct{}),
-		Events:      NewEventLog(),
+		addr:           addr,
+		password:       password,
+		commandTimeout: commandTimeout,
+		logger:         logger,
+		subscribers:    make(map[chan wsMessage]struct{}),
+		residual:       make(map[string]string),
+		Events:         NewEventLog(),
 	}
 }
 
@@ -88,8 +103,16 @@ func (c *Console) Run(ctx context.Context) {
 		}
 
 		c.mu.Lock()
+		established := c.connected
 		c.connected = false
 		c.mu.Unlock()
+
+		// A connection that actually came up earns a fresh backoff, so a
+		// long-lived console that drops once redials immediately instead of
+		// inheriting the saturated delay from an earlier startup race.
+		if established {
+			delay = minReconnectDelay
+		}
 
 		jitter := time.Duration(rand.Int63n(int64(delay) / 2))
 		select {
@@ -111,10 +134,12 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 	defer cancel()
 
 	url := fmt.Sprintf("ws://%s%s", c.addr, consoleEndpoint)
+	// The password rides in the subprotocol list because that is the only
+	// channel mc-server-runner reads it from. Declaring it via Subprotocols
+	// (rather than a hand-set header) also lets the dialer accept the
+	// negotiated protocol the server echoes back in its 101 response.
 	conn, resp, err := websocket.Dial(dialCtx, url, &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Sec-WebSocket-Protocol": {authSubproto + ", " + c.password},
-		},
+		Subprotocols: []string{authSubproto, c.password},
 	})
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
@@ -131,10 +156,17 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 
 	c.logger.Info("console connected", "addr", c.addr)
 
+	clear(c.residual)
+
 	for {
-		var msg wsMessage
-		if err := readJSON(ctx, conn, &msg); err != nil {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
 			return err
+		}
+		var msg wsMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			c.logger.Warn("console frame not decodable, skipping", "error", err)
+			continue
 		}
 		if msg.Type == "authFailure" {
 			return fmt.Errorf("console auth failure: %s", msg.Reason)
@@ -156,7 +188,18 @@ func (c *Console) ingestEvents(msg wsMessage) {
 			c.Events.Ingest(line, now)
 		}
 	case "stdout", "stderr":
-		for _, line := range strings.Split(msg.Data, "\n") {
+		buf := c.residual[msg.Type] + msg.Data
+		end := strings.LastIndex(buf, "\n")
+		if end < 0 {
+			if len(buf) > maxResidualLine {
+				c.logger.Warn("dropping oversized partial console line", "stream", msg.Type, "bytes", len(buf))
+				buf = ""
+			}
+			c.residual[msg.Type] = buf
+			return
+		}
+		c.residual[msg.Type] = buf[end+1:]
+		for _, line := range strings.Split(buf[:end], "\n") {
 			if line == "" {
 				continue
 			}
@@ -217,14 +260,19 @@ func (c *Console) SendCommand(ctx context.Context, cmd string) (string, error) {
 	sub, unsub := c.subscribe()
 	defer unsub()
 
-	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	writeCtx, cancel := context.WithTimeout(ctx, c.commandTimeout)
 	defer cancel()
 	if err := writeJSON(writeCtx, conn, wsMessage{Type: "stdin", Data: cmd + "\n"}); err != nil {
 		return "", fmt.Errorf("write command: %w", err)
 	}
 
+	collect := commandCollectWindow
+	if c.commandTimeout < collect {
+		collect = c.commandTimeout
+	}
+
 	var out []byte
-	deadline := time.After(commandCollectWindow)
+	deadline := time.After(collect)
 	for {
 		select {
 		case msg := <-sub:
@@ -237,14 +285,6 @@ func (c *Console) SendCommand(ctx context.Context, cmd string) (string, error) {
 			return string(out), ctx.Err()
 		}
 	}
-}
-
-func readJSON(ctx context.Context, c *websocket.Conn, v *wsMessage) error {
-	_, data, err := c.Read(ctx)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, v)
 }
 
 func writeJSON(ctx context.Context, c *websocket.Conn, v wsMessage) error {
