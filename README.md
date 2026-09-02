@@ -24,13 +24,9 @@ bridge speaks the console's real transport (`mc-server-runner`'s
 - Messages are JSON: send `{"type":"stdin","data":"<command>\n"}`; the server
   broadcasts `{"type":"stdout"|"stderr","data":"..."}` for console output and
   `{"type":"logHistory","lines":[...]}` once on connect.
-- **Origin checking is on by default and rejects everything** unless the
-  server sets `WEBSOCKET_DISABLE_ORIGIN_CHECK=true` (or configures
-  `WEBSOCKET_ALLOWED_ORIGINS` to include whatever Origin this bridge sends,
-  which by default is none). Since the console is bound to loopback
-  (`127.0.0.1`) and never reachable from outside the pod, disabling the
-  origin check is safe here and is a **required** part of the server's
-  `extraEnv` wiring — see `jdw-deployments/charts/minecraft-fwb`.
+- **Origin checking is on by default and rejects every dial** unless the
+  server container turns it off — see
+  [Server-side prerequisites](#server-side-prerequisites).
 - The protocol carries no request/response correlation id. `SendCommand`
   collects broadcast output for a short fixed window after writing a
   command; concurrent unrelated console activity can appear in that output.
@@ -77,6 +73,20 @@ level.
 | `HTTP_ADDR` | no | `:8080` | Bridge's own HTTP bind address |
 | `CONSOLE_ADDR` | no | `127.0.0.1:8765` | Server's websocket console address |
 | `DATA_DIR` | no | `/data` | Mounted server data volume (read-only) |
+
+## Server-side prerequisites
+
+The bridge cannot connect at all unless the **server** container — not this
+sidecar — runs `mc-server-runner` with `WEBSOCKET_CONSOLE=true`, a
+`WEBSOCKET_PASSWORD` matching the bridge's `CONSOLE_PASSWORD`, and
+`WEBSOCKET_DISABLE_ORIGIN_CHECK=true` (or `WEBSOCKET_ALLOWED_ORIGINS` covering
+the Origin this bridge sends, which by default is none). Disabling the origin
+check adds no exposure here: the console is bound to loopback (`127.0.0.1`)
+and is unreachable from outside the pod.
+
+Those values are owned by the deployment chart
+(`jdw-deployments/charts/minecraft-fwb`, `extraEnv`); the list above is only
+the contract this bridge depends on, not a second copy of the chart's config.
 
 ## Endpoints
 
