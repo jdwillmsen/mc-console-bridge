@@ -27,10 +27,11 @@ bridge speaks the console's real transport (`mc-server-runner`'s
 - **Origin checking is on by default and rejects every dial** unless the
   server container turns it off — see
   [Server-side prerequisites](#server-side-prerequisites).
-- The protocol carries no request/response correlation id. `SendCommand`
-  collects broadcast output for a short fixed window after writing a
-  command; concurrent unrelated console activity can appear in that output.
-  This is a protocol limitation, not fixable client-side.
+- The protocol carries no request/response correlation id. The bridge
+  serializes its own commands, so two concurrent `POST /command` calls cannot
+  collect each other's output — but everything the console broadcasts during
+  the collection window is returned, so unrelated server-side output can
+  still appear. This is a protocol limitation, not fixable client-side.
 - Observed: `say` produced no console output at all with zero players
   online (reproduced twice); `list` round-tripped correctly. Flagging as a
   known quirk — announcements to an empty server may be silent.
@@ -63,6 +64,10 @@ service). Callers must treat a missing XUID as unknown, not as a specific
 level.
 
 `GET /allowlist` parses `<DATA_DIR>/allowlist.json`.
+
+Either file being absent is normal on a fresh volume — the server writes them
+lazily — so both endpoints answer `404` in that case. `500` is reserved for a
+genuine fault: an unreadable mount or unparseable contents.
 
 ## Environment variables
 
