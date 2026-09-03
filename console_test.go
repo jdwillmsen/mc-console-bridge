@@ -217,26 +217,88 @@ func TestConsoleConnectAndRead_AuthFailureNeverEstablishes(t *testing.T) {
 }
 
 func TestConsoleRun_AuthFailureDoesNotResetBackoff(t *testing.T) {
-	var attempts atomic.Int64
+	var mu sync.Mutex
+	var attempts []time.Time
 	addr, _ := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
-		attempts.Add(1)
+		mu.Lock()
+		attempts = append(attempts, time.Now())
+		mu.Unlock()
 		writeTestMsg(t, ctx, conn, wsMessage{Type: "authFailure", Reason: "bad password"})
 	})
 
 	c := NewConsole(addr, "wrong-password", 2*time.Second, testLogger())
+	c.minReconnectDelay = 200 * time.Millisecond
+	c.maxReconnectDelay = 2 * time.Second
 
-	// minReconnectDelay is 1s and maxReconnectDelay 30s. If backoff is
-	// growing correctly (the fix), a 3.5s window fits at most: dial #1
-	// (immediate), then a >=1s wait, dial #2, then a >=2s wait — 2 dials,
-	// never a 3rd. If the reconnect-storm bug were present (backoff reset to
-	// minReconnectDelay after every attempt), the same window would fit
-	// roughly one dial per second: 3+ dials.
-	ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Run(ctx)
+	done := make(chan struct{})
+	go func() {
+		c.Run(ctx)
+		close(done)
+	}()
 
-	if got := attempts.Load(); got > 2 {
-		t.Errorf("observed %d connection attempts in 3.5s, want backoff to keep growing (<=2), not reset on every rejected password (would give 3+)", got)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(attempts)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake server saw %d connection attempts, want 3", n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	mu.Lock()
+	dials := append([]time.Time(nil), attempts[:3]...)
+	mu.Unlock()
+
+	// Every wait is delay+jitter with jitter < delay/2, so under the
+	// reconnect-storm bug (connected promoted right after the handshake, so
+	// Run resets the delay after every rejected password) both gaps land in
+	// [min, 1.5*min). Growing backoff puts the second gap at 2*min plus
+	// jitter, and a sleep can only ever overshoot its floor.
+	gap1, gap2 := dials[1].Sub(dials[0]), dials[2].Sub(dials[1])
+	if want := 2 * c.minReconnectDelay; gap2 < want {
+		t.Errorf("reconnect gaps were %v then %v: backoff did not grow, want the second gap >= %v", gap1, gap2, want)
+	}
+	if c.Connected() {
+		t.Error("Connected() = true after repeated rejected passwords, want false")
+	}
+}
+
+func TestConsoleConnectAndRead_SilentPeerDoesNotHangForever(t *testing.T) {
+	addr, _ := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
+		<-ctx.Done()
+	})
+
+	c := NewConsole(addr, "pw", 2*time.Second, testLogger())
+	c.firstFrameTimeout = 200 * time.Millisecond
+
+	// A peer that completes the handshake and then sends nothing never
+	// promotes the connection, so without a first-frame deadline the read
+	// loop parks forever: never connected, never redialed.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() { errc <- c.connectAndRead(ctx) }()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("connectAndRead returned nil, want an error for a silent peer")
+		}
+	case <-ctx.Done():
+		t.Fatalf("connectAndRead never returned for a peer that sent no frame within %v", c.firstFrameTimeout)
+	}
+	if c.Connected() {
+		t.Error("Connected() = true for a peer that sent no frame, want false")
 	}
 }
 

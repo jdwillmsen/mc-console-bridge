@@ -72,6 +72,7 @@ level.
 | `CONSOLE_PASSWORD` | yes | — | Must match the server's `WEBSOCKET_PASSWORD` |
 | `HTTP_ADDR` | no | `:8080` | Bridge's own HTTP bind address |
 | `CONSOLE_ADDR` | no | `127.0.0.1:8765` | Server's websocket console address |
+| `COMMAND_TIMEOUT_MS` | no | `2000` | Bounds the console write for one `/command`, and caps the window spent collecting that command's output. The HTTP response write deadline is derived from it |
 | `DATA_DIR` | no | `/data` | Mounted server data volume (read-only) |
 
 ## Server-side prerequisites

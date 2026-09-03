@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -37,7 +38,7 @@ func main() {
 		Handler:           newMux(srv),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      responseWriteTimeout(cfg.CommandTimeout),
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -52,8 +53,17 @@ func main() {
 	err = httpServer.ListenAndServe()
 	stop() // unblocks console.Run's ctx.Done() promptly if ListenAndServe returned on its own
 	wg.Wait()
-	if err != nil && err != http.ErrServerClosed {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("http server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// responseWriteTimeout derives the http.Server write deadline from the
+// configured command timeout. POST /command can legitimately occupy
+// CommandTimeout on the console write plus the output-collection window, and
+// a deadline shorter than that truncates the response of a command the
+// console has already run.
+func responseWriteTimeout(commandTimeout time.Duration) time.Duration {
+	return max(10*time.Second, commandTimeout+commandCollectWindow+5*time.Second)
 }

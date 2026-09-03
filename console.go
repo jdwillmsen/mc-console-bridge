@@ -34,6 +34,22 @@ const (
 	minReconnectDelay = 1 * time.Second
 	maxReconnectDelay = 30 * time.Second
 
+	// The console is idle for long stretches on a quiet server, so the read
+	// loop cannot use a deadline to notice a peer that has gone away.
+	// coder/websocket sends no pings of its own and TCP keepalives take
+	// minutes to fire, so a half-open connection (NAT idle reap, the server
+	// container vanishing without an RST) would otherwise leave Read blocked
+	// while /readyz still reported the console up.
+	pingInterval = 30 * time.Second
+	pingTimeout  = 10 * time.Second
+
+	// firstFrameTimeout bounds the wait for the first frame after a
+	// successful handshake. mc-server-runner sends its logHistory backfill
+	// immediately; silence past this means the peer is not really serving.
+	// The connection is only promoted on that first frame, so without this
+	// deadline a silent peer would neither connect nor redial.
+	firstFrameTimeout = 15 * time.Second
+
 	// maxResidualLine bounds the partial-line buffer held between websocket
 	// frames. A console line longer than this is discarded rather than grown
 	// without limit, mirroring ParseEvents' scanner cap.
@@ -58,6 +74,13 @@ type Console struct {
 	password       string
 	commandTimeout time.Duration
 	logger         *slog.Logger
+
+	// The reconnect bounds and the first-frame deadline are fields rather
+	// than constants so tests can drive the connect schedule on a short,
+	// deterministic timescale.
+	minReconnectDelay time.Duration
+	maxReconnectDelay time.Duration
+	firstFrameTimeout time.Duration
 
 	mu        sync.Mutex
 	conn      *websocket.Conn
@@ -86,15 +109,19 @@ func NewConsole(addr, password string, commandTimeout time.Duration, logger *slo
 		password:       password,
 		commandTimeout: commandTimeout,
 		logger:         logger,
-		subscribers:    make(map[chan wsMessage]struct{}),
-		residual:       make(map[string]string),
-		Events:         NewEventLog(),
+
+		minReconnectDelay: minReconnectDelay,
+		maxReconnectDelay: maxReconnectDelay,
+		firstFrameTimeout: firstFrameTimeout,
+		subscribers:       make(map[chan wsMessage]struct{}),
+		residual:          make(map[string]string),
+		Events:            NewEventLog(),
 	}
 }
 
 // Run connects and reconnects with backoff until ctx is cancelled.
 func (c *Console) Run(ctx context.Context) {
-	delay := minReconnectDelay
+	delay := c.minReconnectDelay
 	for {
 		if ctx.Err() != nil {
 			return
@@ -119,19 +146,22 @@ func (c *Console) Run(ctx context.Context) {
 		// long-lived console that drops once redials immediately instead of
 		// inheriting the saturated delay from an earlier startup race.
 		if established {
-			delay = minReconnectDelay
+			delay = c.minReconnectDelay
 		}
 
-		jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+		var jitter time.Duration
+		if half := int64(delay) / 2; half > 0 {
+			jitter = time.Duration(rand.Int63n(half))
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(delay + jitter):
 		}
-		if delay < maxReconnectDelay {
+		if delay < c.maxReconnectDelay {
 			delay *= 2
-			if delay > maxReconnectDelay {
-				delay = maxReconnectDelay
+			if delay > c.maxReconnectDelay {
+				delay = c.maxReconnectDelay
 			}
 		}
 	}
@@ -169,8 +199,23 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 	// WEBSOCKET_PASSWORD hammered the server every second, forever.
 	established := false
 
+	// A completed handshake proves nothing about the peer, so both the wait
+	// for that first frame and the long idle read afterwards need their own
+	// liveness bound. Cancelling readCtx is what unblocks conn.Read and
+	// hands control back to Run's backoff.
+	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+
+	firstFrame := time.AfterFunc(c.firstFrameTimeout, func() {
+		c.logger.Warn("no console frame after handshake, redialing", "addr", c.addr)
+		cancelRead()
+	})
+	defer firstFrame.Stop()
+
+	go c.keepalive(readCtx, conn, cancelRead)
+
 	for {
-		_, data, err := conn.Read(ctx)
+		_, data, err := conn.Read(readCtx)
 		if err != nil {
 			return err
 		}
@@ -183,6 +228,7 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 			return fmt.Errorf("%w: %s", ErrAuthFailure, msg.Reason)
 		}
 		if !established {
+			firstFrame.Stop()
 			c.mu.Lock()
 			c.conn = conn
 			c.connected = true
@@ -193,6 +239,33 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 		}
 		c.ingestEvents(msg)
 		c.broadcast(msg)
+	}
+}
+
+// keepalive pings the peer until ctx ends, cancelling the read loop through
+// onFailure when a ping goes unanswered. Ping needs the read loop running
+// concurrently to see the pong, which is exactly where it is started from.
+func (c *Console) keepalive(ctx context.Context, conn *websocket.Conn, onFailure context.CancelFunc) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			c.logger.Warn("console ping unanswered, redialing", "addr", c.addr, "error", err)
+			onFailure()
+			return
+		}
 	}
 }
 
@@ -276,6 +349,15 @@ var ErrAuthFailure = errors.New("console auth failure")
 // best-effort: the protocol has no correlation id, so concurrent console
 // activity from other sources can appear in the result.
 func (c *Console) SendCommand(ctx context.Context, cmd string) (string, error) {
+	// Serialize the whole write-plus-collect sequence: without this, two
+	// concurrent callers can interleave their stdin writes and each collect
+	// output that belongs to the other command. The connection is sampled
+	// only once this lock is held, so a caller that spent the wait queued
+	// behind someone else's collect window writes to whatever connection is
+	// live now rather than one that has since been dropped and replaced.
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+
 	c.mu.Lock()
 	conn := c.conn
 	connected := c.connected
@@ -283,12 +365,6 @@ func (c *Console) SendCommand(ctx context.Context, cmd string) (string, error) {
 	if !connected || conn == nil {
 		return "", ErrNotConnected
 	}
-
-	// Serialize the whole write-plus-collect sequence: without this, two
-	// concurrent callers can interleave their stdin writes and each collect
-	// output that belongs to the other command.
-	c.cmdMu.Lock()
-	defer c.cmdMu.Unlock()
 
 	sub, unsub := c.subscribe()
 	defer unsub()
