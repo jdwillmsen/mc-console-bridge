@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -23,12 +24,21 @@ func main() {
 	defer stop()
 
 	console := NewConsole(cfg.ConsoleAddr, cfg.ConsolePassword, cfg.CommandTimeout, logger)
-	go console.Run(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		console.Run(ctx)
+	}()
 
 	srv := &server{cfg: cfg, console: console, logger: logger}
 	httpServer := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: newMux(srv),
+		Addr:              cfg.HTTPAddr,
+		Handler:           newMux(srv),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -39,7 +49,10 @@ func main() {
 	}()
 
 	logger.Info("starting", "http_addr", cfg.HTTPAddr, "console_addr", cfg.ConsoleAddr)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	err = httpServer.ListenAndServe()
+	stop() // unblocks console.Run's ctx.Done() promptly if ListenAndServe returned on its own
+	wg.Wait()
+	if err != nil && err != http.ErrServerClosed {
 		logger.Error("http server error", "error", err)
 		os.Exit(1)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -10,7 +11,7 @@ import (
 // ErrCommandNotAllowed is returned when a command does not match any
 // allowlisted template. It is the only path by which a command is refused
 // or accepted — there is no free-text fallback.
-var ErrCommandNotAllowed = fmt.Errorf("command not allowed")
+var ErrCommandNotAllowed = errors.New("command not allowed")
 
 // target matches a single selector or player name token: a Bedrock selector
 // (@a, @p, @s, @r, @e, optionally with [args]) or a bare name with no

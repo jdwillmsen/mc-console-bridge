@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -62,6 +63,11 @@ type Console struct {
 	conn      *websocket.Conn
 	connected bool
 
+	// cmdMu serializes SendCommand's write-plus-collect sequence so two
+	// concurrent callers don't interleave writes and each collect the
+	// other's output.
+	cmdMu sync.Mutex
+
 	subMu       sync.Mutex
 	subscribers map[chan wsMessage]struct{}
 
@@ -95,6 +101,7 @@ func (c *Console) Run(ctx context.Context) {
 		}
 
 		err := c.connectAndRead(ctx)
+		metricConsoleReconnects.Inc()
 		if ctx.Err() != nil {
 			return
 		}
@@ -106,6 +113,7 @@ func (c *Console) Run(ctx context.Context) {
 		established := c.connected
 		c.connected = false
 		c.mu.Unlock()
+		metricConsoleConnected.Set(0)
 
 		// A connection that actually came up earns a fresh backoff, so a
 		// long-lived console that drops once redials immediately instead of
@@ -149,14 +157,17 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 	}
 	defer conn.CloseNow()
 
-	c.mu.Lock()
-	c.conn = conn
-	c.connected = true
-	c.mu.Unlock()
-
-	c.logger.Info("console connected", "addr", c.addr)
-
 	clear(c.residual)
+
+	// The connection is not promoted to c.conn/c.connected until the first
+	// non-authFailure frame arrives. mc-server-runner accepts the websocket
+	// handshake before it has checked the password - auth is confirmed only
+	// by what arrives afterward - so setting connected right after Dial
+	// would mark a rejected password as an established session. Run's
+	// backoff-reset logic keys off c.connected, so that earlier bug reset
+	// the reconnect delay to minReconnectDelay on every attempt: a wrong
+	// WEBSOCKET_PASSWORD hammered the server every second, forever.
+	established := false
 
 	for {
 		_, data, err := conn.Read(ctx)
@@ -169,7 +180,16 @@ func (c *Console) connectAndRead(ctx context.Context) error {
 			continue
 		}
 		if msg.Type == "authFailure" {
-			return fmt.Errorf("console auth failure: %s", msg.Reason)
+			return fmt.Errorf("%w: %s", ErrAuthFailure, msg.Reason)
+		}
+		if !established {
+			c.mu.Lock()
+			c.conn = conn
+			c.connected = true
+			c.mu.Unlock()
+			metricConsoleConnected.Set(1)
+			c.logger.Info("console connected", "addr", c.addr)
+			established = true
 		}
 		c.ingestEvents(msg)
 		c.broadcast(msg)
@@ -242,7 +262,14 @@ func (c *Console) Connected() bool {
 
 // ErrNotConnected is returned by SendCommand when no console connection is
 // currently established.
-var ErrNotConnected = fmt.Errorf("console not connected")
+var ErrNotConnected = errors.New("console not connected")
+
+// ErrAuthFailure indicates the server rejected the configured
+// CONSOLE_PASSWORD. It is returned by connectAndRead so tests can assert on
+// it via errors.Is; Run itself needs no special case for it; connectAndRead
+// never promotes c.connected to true on this path, so Run's own
+// backoff-reset check already declines to reset the delay.
+var ErrAuthFailure = errors.New("console auth failure")
 
 // SendCommand writes a command to the console and collects any stdout/stderr
 // broadcasts that follow within commandCollectWindow. The output is
@@ -256,6 +283,12 @@ func (c *Console) SendCommand(ctx context.Context, cmd string) (string, error) {
 	if !connected || conn == nil {
 		return "", ErrNotConnected
 	}
+
+	// Serialize the whole write-plus-collect sequence: without this, two
+	// concurrent callers can interleave their stdin writes and each collect
+	// output that belongs to the other command.
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
 
 	sub, unsub := c.subscribe()
 	defer unsub()

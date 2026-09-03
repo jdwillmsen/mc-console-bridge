@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 func testConsole() *Console {
@@ -72,7 +79,7 @@ func TestConsoleIngestEvents_DropsOversizedPartialLine(t *testing.T) {
 
 func TestConsoleSendCommand_NotConnected(t *testing.T) {
 	c := testConsole()
-	if _, err := c.SendCommand(t.Context(), "list"); err != ErrNotConnected {
+	if _, err := c.SendCommand(t.Context(), "list"); !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("err = %v, want ErrNotConnected", err)
 	}
 }
@@ -114,6 +121,192 @@ func TestHealthzStaysGreenWhileConsoleIsDown(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("/healthz = %d, want 200", rec.Code)
+	}
+}
+
+// startFakeConsole runs a minimal server that speaks just enough of
+// mc-server-runner's websocket console protocol to drive Console against it.
+// handler receives the connection and the password the client offered via
+// the Sec-WebSocket-Protocol subprotocol list (there is no other channel
+// mc-server-runner reads it from), and owns the whole connection lifecycle.
+func startFakeConsole(t *testing.T, handler func(ctx context.Context, conn *websocket.Conn, password string)) (addr string, connections *atomic.Int64) {
+	t.Helper()
+	var count atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		handler(r.Context(), conn, subprotocolPassword(r))
+	}))
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://"), &count
+}
+
+// subprotocolPassword extracts the password from the Sec-WebSocket-Protocol
+// header the way mc-server-runner does: the client offers
+// [authSubproto, password], and the real server reads the second element
+// directly from the header rather than from whichever protocol got
+// negotiated.
+func subprotocolPassword(r *http.Request) string {
+	parts := strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func writeTestMsg(t *testing.T, ctx context.Context, conn *websocket.Conn, msg wsMessage) {
+	t.Helper()
+	if err := writeJSON(ctx, conn, msg); err != nil {
+		t.Logf("fake console: write failed (client likely closed): %v", err)
+	}
+}
+
+func readTestMsg(ctx context.Context, conn *websocket.Conn) (wsMessage, error) {
+	var msg wsMessage
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		return msg, err
+	}
+	err = json.Unmarshal(data, &msg)
+	return msg, err
+}
+
+// waitConnected polls until c reports connected, or fails the test after a
+// generous deadline. This is a state-condition poll, not a fixed sleep: it
+// returns as soon as the condition is true and only fails if it genuinely
+// never becomes true.
+func waitConnected(t *testing.T, c *Console) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c.Connected() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("console never reported connected")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestConsoleConnectAndRead_AuthFailureNeverEstablishes(t *testing.T) {
+	addr, attempts := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
+		writeTestMsg(t, ctx, conn, wsMessage{Type: "authFailure", Reason: "bad password"})
+	})
+
+	c := NewConsole(addr, "wrong-password", 2*time.Second, testLogger())
+
+	err := c.connectAndRead(context.Background())
+	if !errors.Is(err, ErrAuthFailure) {
+		t.Fatalf("err = %v, want ErrAuthFailure", err)
+	}
+	if c.Connected() {
+		t.Error("Connected() = true after an auth failure, want false — Run's backoff-reset check keys off this and would otherwise reset the delay on every rejected password, hammering the server every second forever")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("fake server saw %d connections, want exactly 1", got)
+	}
+}
+
+func TestConsoleRun_AuthFailureDoesNotResetBackoff(t *testing.T) {
+	var attempts atomic.Int64
+	addr, _ := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
+		attempts.Add(1)
+		writeTestMsg(t, ctx, conn, wsMessage{Type: "authFailure", Reason: "bad password"})
+	})
+
+	c := NewConsole(addr, "wrong-password", 2*time.Second, testLogger())
+
+	// minReconnectDelay is 1s and maxReconnectDelay 30s. If backoff is
+	// growing correctly (the fix), a 3.5s window fits at most: dial #1
+	// (immediate), then a >=1s wait, dial #2, then a >=2s wait — 2 dials,
+	// never a 3rd. If the reconnect-storm bug were present (backoff reset to
+	// minReconnectDelay after every attempt), the same window would fit
+	// roughly one dial per second: 3+ dials.
+	ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+	defer cancel()
+	c.Run(ctx)
+
+	if got := attempts.Load(); got > 2 {
+		t.Errorf("observed %d connection attempts in 3.5s, want backoff to keep growing (<=2), not reset on every rejected password (would give 3+)", got)
+	}
+}
+
+func TestConsoleConnectAndRead_EstablishesOnFirstRealFrame(t *testing.T) {
+	addr, _ := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
+		writeTestMsg(t, ctx, conn, wsMessage{Type: "logHistory"})
+		<-ctx.Done()
+	})
+
+	c := NewConsole(addr, "pw", 2*time.Second, testLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.connectAndRead(ctx)
+		close(done)
+	}()
+
+	waitConnected(t, c)
+	cancel()
+	<-done
+}
+
+func TestConsoleSendCommand_ConcurrentCallsDoNotInterleave(t *testing.T) {
+	addr, _ := startFakeConsole(t, func(ctx context.Context, conn *websocket.Conn, password string) {
+		writeTestMsg(t, ctx, conn, wsMessage{Type: "logHistory"})
+		for {
+			msg, err := readTestMsg(ctx, conn)
+			if err != nil {
+				return
+			}
+			if msg.Type != "stdin" {
+				continue
+			}
+			cmd := strings.TrimSuffix(msg.Data, "\n")
+			// A small delay widens the window in which a missing lock would
+			// let two concurrent SendCommand calls collect each other's
+			// output.
+			time.Sleep(20 * time.Millisecond)
+			writeTestMsg(t, ctx, conn, wsMessage{Type: "stdout", Data: "echo:" + cmd + "\n"})
+		}
+	})
+
+	c := NewConsole(addr, "pw", 2*time.Second, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	waitConnected(t, c)
+
+	cmds := []string{"list", "time query day"}
+	results := make([]string, len(cmds))
+	var wg sync.WaitGroup
+	for i, cmd := range cmds {
+		wg.Add(1)
+		go func(i int, cmd string) {
+			defer wg.Done()
+			out, err := c.SendCommand(context.Background(), cmd)
+			if err != nil {
+				t.Errorf("SendCommand(%q): %v", cmd, err)
+			}
+			results[i] = out
+		}(i, cmd)
+	}
+	wg.Wait()
+
+	for i, cmd := range cmds {
+		want := "echo:" + cmd
+		if strings.Count(results[i], "echo:") != 1 || !strings.Contains(results[i], want) {
+			t.Errorf("SendCommand(%q) output = %q, want exactly %q with nothing interleaved from the other concurrent command", cmd, results[i], want)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,10 +28,21 @@ var (
 		Name: "mc_console_bridge_commands_failed_total",
 		Help: "Allowlisted console commands that could not be delivered to the server.",
 	})
+	metricConsoleConnected = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "mc_console_bridge_console_connected",
+		Help: "Whether the websocket console connection is currently established (1) or not (0).",
+	})
+	metricConsoleReconnects = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "mc_console_bridge_console_reconnects_total",
+		Help: "Console connection attempts that ended (successfully established or not) since startup.",
+	})
 )
 
 func init() {
-	prometheus.MustRegister(metricCommandsRun, metricCommandsRefused, metricCommandsFailed)
+	prometheus.MustRegister(
+		metricCommandsRun, metricCommandsRefused, metricCommandsFailed,
+		metricConsoleConnected, metricConsoleReconnects,
+	)
 }
 
 type server struct {
@@ -127,39 +139,55 @@ func (s *server) handleCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metricCommandsRun.Inc()
-	writeJSONResponse(w, commandResponse{Rule: rule, Output: out})
+	writeJSONResponse(w, s.logger, commandResponse{Rule: rule, Output: out})
 }
 
 func (s *server) handlePermissions(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(filepath.Join(s.cfg.DataDir, "permissions.json"))
 	if err != nil {
-		http.Error(w, "permissions.json unavailable", http.StatusInternalServerError)
+		s.handleDataFileOpenError(w, "permissions.json", err)
 		return
 	}
 	defer f.Close()
 
 	perms, err := ParsePermissions(f)
 	if err != nil {
+		s.logger.Error("permissions.json unparseable", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSONResponse(w, perms)
+	writeJSONResponse(w, s.logger, perms)
 }
 
 func (s *server) handleAllowlist(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(filepath.Join(s.cfg.DataDir, "allowlist.json"))
 	if err != nil {
-		http.Error(w, "allowlist.json unavailable", http.StatusInternalServerError)
+		s.handleDataFileOpenError(w, "allowlist.json", err)
 		return
 	}
 	defer f.Close()
 
 	entries, err := ParseAllowlist(f)
 	if err != nil {
+		s.logger.Error("allowlist.json unparseable", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSONResponse(w, entries)
+	writeJSONResponse(w, s.logger, entries)
+}
+
+// handleDataFileOpenError distinguishes "the file genuinely isn't there yet"
+// (404, logged at info — expected before the server has written it, or
+// during a restore) from any other open failure such as a permissions
+// problem on the mounted volume (500, logged at error — worth alerting on).
+func (s *server) handleDataFileOpenError(w http.ResponseWriter, name string, err error) {
+	if errors.Is(err, os.ErrNotExist) {
+		s.logger.Info(name+" not present yet", "error", err)
+		http.Error(w, name+" not found", http.StatusNotFound)
+		return
+	}
+	s.logger.Error(name+" unavailable", "error", err)
+	http.Error(w, name+" unavailable", http.StatusInternalServerError)
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -172,10 +200,14 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		since = parsed
 	}
-	writeJSONResponse(w, s.console.Events.Since(since))
+	writeJSONResponse(w, s.logger, s.console.Events.Since(since))
 }
 
-func writeJSONResponse(w http.ResponseWriter, v any) {
+func writeJSONResponse(w http.ResponseWriter, logger *slog.Logger, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// Headers are already sent, so this can't become an HTTP error
+		// response — logging is the only recourse.
+		logger.Warn("failed writing JSON response", "error", err)
+	}
 }
